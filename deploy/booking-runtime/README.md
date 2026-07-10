@@ -21,15 +21,18 @@ are versioned separately in the Booking project.
 
 ## Build and run
 
+All paths below are relative to `deploy/booking-runtime/` in the fork. The committed
+`docker-compose.yml` builds the app image from the fork root (`context: ../..`) and creates
+`registry/`, `storage/`, and `db-data/` here (all git-ignored).
+
 ```bash
-cp deploy/booking-runtime/.env.example /opt/booking-runtime/.env   # then set DB_ROOT_PASSWORD
-cd /opt/booking-runtime
+cd deploy/booking-runtime
+cp .env.example .env && chmod 600 .env      # then set DB_ROOT_PASSWORD
 # The bind-mounted storage tree must be writable by the container's app user (php-fpm runs as
 # www-data = uid 33); EA refuses to start otherwise.
 mkdir -p storage/cache storage/logs storage/sessions storage/uploads registry db-data
 chown -R 33:33 storage
-docker compose -f docker-compose.yml build app
-docker compose up -d
+docker compose up -d --build
 ```
 
 The app answers only for provisioned tenants: an unmapped `Host` returns `404`
@@ -38,14 +41,18 @@ business's `/booking/` to `127.0.0.1:9101`.
 
 ## Provision / deprovision a tenant
 
-Use the Provider Driver CLI (`../tenancy/provision-tenant`) from the runtime dir:
+Run the Provider Driver CLI with `BOOKING_RUNTIME_DIR` pointing at the runtime dir (the CLI
+defaults to `/opt/booking-runtime`; set it explicitly when running from the fork tree):
 
 ```bash
-./src/deploy/tenancy/provision-tenant provision demo-salon --company "Aphrodite Beauty & Spa"
-./src/deploy/tenancy/provision-tenant seed demo-salon ./src/deploy/tenancy/seed/demo-salon.sql
-./src/deploy/tenancy/provision-tenant serving-fragment demo-salon   # emits the nginx /booking/ block
-./src/deploy/tenancy/provision-tenant health demo-salon             # prints the HTTP status
-./src/deploy/tenancy/provision-tenant list
+cd deploy/booking-runtime
+export BOOKING_RUNTIME_DIR="$(pwd)" BOOKING_BASE_DOMAIN=cyprusinfo.dev
+CLI=../tenancy/provision-tenant
+$CLI provision demo-salon --company "Aphrodite Beauty & Spa"
+$CLI seed demo-salon ../tenancy/seed/demo-salon.sql
+$CLI serving-fragment demo-salon   # emits the nginx /booking/ block
+$CLI health demo-salon             # prints the HTTP status
+$CLI list
 ```
 
 `provision` is idempotent: re-running with an existing DB + schema is a no-op.
@@ -53,9 +60,17 @@ Use the Provider Driver CLI (`../tenancy/provision-tenant`) from the runtime dir
 ## Teardown (no platform impact)
 
 ```bash
-./src/deploy/tenancy/provision-tenant deprovision demo-salon      # drop DB + user + registry + storage
+cd deploy/booking-runtime
+export BOOKING_RUNTIME_DIR="$(pwd)"
+../tenancy/provision-tenant deprovision demo-salon   # drop DB + user + registry + storage
 rm -f /etc/nginx/sites-enabled/booking-demo-demo-salon.conf \
       /etc/nginx/sites-available/booking-demo-demo-salon.conf
 nginx -t && systemctl reload nginx
-docker compose -f /opt/booking-runtime/docker-compose.yml down -v  # removes the stack + db-data
+docker compose down -v                               # removes the stack + db-data
 ```
+
+> **Live server layout differs.** On `test-web-01` the runtime lives at `/opt/booking-runtime`
+> with this fork cloned to `./src`, the image pre-built, and the compose file hand-authored to
+> reference that image (so `BOOKING_RUNTIME_DIR=/opt/booking-runtime` and the CLI is at
+> `./src/deploy/tenancy/provision-tenant`). That exact procedure is the multi-tenant demo runbook
+> in the Booking project's `docs/guides/`.
