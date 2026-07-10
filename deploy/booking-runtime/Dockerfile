@@ -2,7 +2,13 @@
 FROM node:22-bookworm-slim AS assets
 WORKDIR /src
 COPY . .
-RUN npm ci --no-audit --no-fund && npx gulp compile
+# Upstream's lockfile pins @babel/core 8 + gulp-babel 8.1, which are incompatible — gulp-babel throws a
+# TypeError per file (swallowed by gulp's plumber), so NO assets/js/*.min.js are produced and the booking
+# UI 404s its scripts. Pin a compatible Babel 7 toolchain at BUILD TIME only (--no-save) so we never edit
+# the upstream-tracked package.json / package-lock.json (keeps the fork additive-only, ADR 0008).
+RUN npm ci --no-audit --no-fund \
+ && npm install --no-save @babel/core@^7.28.0 @babel/preset-env@^7.28.0 \
+ && npx gulp compile
 
 # ---- php deps ----
 FROM composer:2 AS vendor
@@ -20,7 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends nginx default-m
 WORKDIR /var/www/html
 COPY . .
 COPY --from=vendor /src/vendor ./vendor
-COPY --from=assets /src/assets/vendor ./assets/vendor
+# The whole compiled assets tree from the build stage: gulp's minified assets/js/*.min.js +
+# assets/css/*.css + assets/vendor. These are git-ignored (build output), so `COPY . .` never brings
+# them — copying only assets/vendor left the page referencing 404'd *.min.js/css (unstyled booking page).
+COPY --from=assets /src/assets ./assets
 COPY deploy/booking-runtime/config.stub.php ./config.php
 COPY deploy/booking-runtime/nginx-app.conf /etc/nginx/sites-available/default
 RUN mkdir -p storage/sessions storage/cache storage/logs storage/uploads && chown -R www-data:www-data storage \

@@ -12,6 +12,15 @@ valid_slug(){ [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] && \
   ! grep -qxF "$1" <<<"www api mail admin dashboard app cdn static assets status docs deploy preview staging test dev internal cf pb pocketbase"; }
 
 cmd="${1:-}"; slug="${2:-}"
+# Optional flags after the slug (currently just --company "NAME").
+company=""
+_argv=("$@"); _i=2
+while [ "$_i" -lt "${#_argv[@]}" ]; do
+  case "${_argv[$_i]}" in
+    --company) company="${_argv[$((_i+1))]:-}"; _i=$((_i+2));;
+    *) _i=$((_i+1));;
+  esac
+done
 
 provision(){
   valid_slug "$slug" || { echo "invalid slug"; exit 1; }
@@ -44,6 +53,11 @@ PHP
   # 4) migrate + seed (idempotent: only install on an empty schema)
   if ! mysql_root -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema='${db}' AND table_name='ea_users' LIMIT 1;" | grep -q 1; then
     dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php console install
+  fi
+  # 5) apply the business display name (idempotent every run) so it isn't the default "Company Name".
+  if [ -n "$company" ]; then
+    local co; co="$(printf '%s' "$company" | tr -d '\r\n\\`' | cut -c1-190)"; co="${co//\'/\'\'}"
+    mysql_root "$db" -e "UPDATE ea_settings SET value='${co}' WHERE name='company_name';" || true
   fi
   echo "provisioned: ${slug} (db=${db})"
 }
