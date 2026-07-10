@@ -1,0 +1,4 @@
+# Per-tenant registry entries carry DB credentials — never commit them.
+*.php
+!.gitignore
+!example.php
