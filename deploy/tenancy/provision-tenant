@@ -36,8 +36,11 @@ provision(){
 <?php return ['slug'=>'${slug}','db_host'=>'db','db_name'=>'${db}','db_username'=>'${user}','db_password'=>'${pass}','status'=>'active'];
 PHP
   chmod 640 "registry/${slug}.php"
-  # 3) per-tenant writable dirs
-  dc exec -T app sh -lc "mkdir -p storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug} && chown -R www-data:www-data storage/*/${slug}"
+  # The app (php-fpm) runs as www-data (uid 33 in the image); it must be able to read the credential.
+  chown 33:33 "registry/${slug}.php" 2>/dev/null || true
+  # 3) per-tenant writable dirs, and (defensively) ensure the base storage tree is owned by the app
+  #    user — EA verifies storage/ and its subdirs are writable by www-data at startup.
+  dc exec -T app sh -lc "mkdir -p storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug} && chown www-data:www-data storage storage/sessions storage/cache storage/logs storage/uploads && chown -R www-data:www-data storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug}"
   # 4) migrate + seed (idempotent: only install on an empty schema)
   if ! mysql_root -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema='${db}' AND table_name='ea_users' LIMIT 1;" | grep -q 1; then
     dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php console install

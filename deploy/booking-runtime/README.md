@@ -24,6 +24,10 @@ are versioned separately in the Booking project.
 ```bash
 cp deploy/booking-runtime/.env.example /opt/booking-runtime/.env   # then set DB_ROOT_PASSWORD
 cd /opt/booking-runtime
+# The bind-mounted storage tree must be writable by the container's app user (php-fpm runs as
+# www-data = uid 33); EA refuses to start otherwise.
+mkdir -p storage/cache storage/logs storage/sessions storage/uploads registry db-data
+chown -R 33:33 storage
 docker compose -f docker-compose.yml build app
 docker compose up -d
 ```
