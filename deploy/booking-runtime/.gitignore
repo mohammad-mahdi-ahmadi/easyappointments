@@ -1,0 +1,5 @@
+# Runtime-generated at /opt/booking-runtime — never part of the repo or image.
+.env
+db-data/
+storage/
+registry/

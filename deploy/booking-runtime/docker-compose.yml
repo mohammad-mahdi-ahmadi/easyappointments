@@ -1,0 +1,33 @@
+name: booking-runtime
+services:
+  app:
+    build: { context: ../.., dockerfile: deploy/booking-runtime/Dockerfile }
+    image: booking-ea:local
+    container_name: booking-ea-app
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      EA_REGISTRY_DIR: /var/www/html/deploy/tenancy/registry
+    volumes:
+      - ./registry:/var/www/html/deploy/tenancy/registry
+      - ./storage:/var/www/html/storage
+    ports: ["127.0.0.1:9101:80"]
+    depends_on: { db: { condition: service_healthy } }
+    networks: [eanet]
+    mem_limit: 320m
+  db:
+    image: mariadb:11.8
+    container_name: booking-ea-db
+    restart: unless-stopped
+    command: ["--innodb-buffer-pool-size=128M","--max-connections=60"]
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes: ["./db-data:/var/lib/mysql"]
+    networks: [eanet]
+    healthcheck:
+      test: ["CMD","healthcheck.sh","--connect","--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 640m
+networks: { eanet: { driver: bridge } }
