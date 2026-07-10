@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Provider Driver (Easy!Appointments) — idempotent tenant lifecycle on the booking-runtime stack.
+set -euo pipefail
+RUNTIME_DIR="${BOOKING_RUNTIME_DIR:-/opt/booking-runtime}"
+BASE_DOMAIN="${BOOKING_BASE_DOMAIN:-cyprusinfo.dev}"
+UPSTREAM="127.0.0.1:9101"
+cd "$RUNTIME_DIR"
+set -a; . ./.env; set +a
+dc(){ docker compose "$@"; }
+mysql_root(){ dc exec -T db mariadb -uroot -p"$DB_ROOT_PASSWORD" "$@"; }
+valid_slug(){ [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] && \
+  ! grep -qxF "$1" <<<"www api mail admin dashboard app cdn static assets status docs deploy preview staging test dev internal cf pb pocketbase"; }
+
+cmd="${1:-}"; slug="${2:-}"
+
+provision(){
+  valid_slug "$slug" || { echo "invalid slug"; exit 1; }
+  # MySQL identifier: hyphens -> underscores. InnoDB fails to RENAME tables in a
+  # database whose on-disk dir encodes a '-' (errno 194); the slug keeps its hyphen
+  # everywhere else (Host, cookie, storage) because bootstrap reads db_name from the registry.
+  local ident="ea_${slug//-/_}" db user pass
+  db="$ident"; user="$ident"
+  pass="$(openssl rand -hex 24)"
+  # 1) DB + user (idempotent; keep the existing password if the registry already has one).
+  # Read it straight from the host-side registry file — no container round-trip, so a re-run
+  # works even if the app container is down.
+  if [ -f "registry/${slug}.php" ]; then
+    pass="$(sed -n "s/.*'db_password'=>'\([^']*\)'.*/\1/p" "registry/${slug}.php")"
+  fi
+  mysql_root -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4;
+                 CREATE USER IF NOT EXISTS '${user}'@'%' IDENTIFIED BY '${pass}';
+                 ALTER USER '${user}'@'%' IDENTIFIED BY '${pass}';
+                 GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${user}'@'%'; FLUSH PRIVILEGES;"
+  # 2) registry entry (0640)
+  cat > "registry/${slug}.php" <<PHP
+<?php return ['slug'=>'${slug}','db_host'=>'db','db_name'=>'${db}','db_username'=>'${user}','db_password'=>'${pass}','status'=>'active'];
+PHP
+  chmod 640 "registry/${slug}.php"
+  # 3) per-tenant writable dirs
+  dc exec -T app sh -lc "mkdir -p storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug} && chown -R www-data:www-data storage/*/${slug}"
+  # 4) migrate + seed (idempotent: only install on an empty schema)
+  if ! mysql_root -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema='${db}' AND table_name='ea_users' LIMIT 1;" | grep -q 1; then
+    dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php console install
+  fi
+  echo "provisioned: ${slug} (db=${db})"
+}
+
+seed(){ # optional rich seed: provision-tenant seed <slug> <file.sql>
+  local db="ea_${slug//-/_}" file="${3:?seed file required}"
+  dc exec -T db mariadb -uroot -p"$DB_ROOT_PASSWORD" "$db" < "$file"
+  echo "seeded ${slug} from ${file}"
+}
+
+deprovision(){
+  local ident="ea_${slug//-/_}"
+  mysql_root -e "DROP DATABASE IF EXISTS \`${ident}\`; DROP USER IF EXISTS '${ident}'@'%'; FLUSH PRIVILEGES;" || true
+  rm -f "registry/${slug}.php"
+  dc exec -T app sh -lc "rm -rf storage/*/${slug}" || true
+  echo "deprovisioned: ${slug}"
+}
+
+serving_fragment(){ cat <<NGINX
+    location /booking/ {
+        proxy_pass http://${UPSTREAM}/;
+        proxy_set_header Host ${slug}.${BASE_DOMAIN};
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+        proxy_buffer_size 16k; proxy_buffers 8 16k;
+    }
+NGINX
+}
+
+health(){ curl -s -o /dev/null -w '%{http_code}\n' -H "Host: ${slug}.${BASE_DOMAIN}" -H 'X-Forwarded-Proto: https' "http://${UPSTREAM}/index.php/booking"; }
+
+case "$cmd" in
+  provision) provision;; seed) seed "$@";; deprovision) deprovision;;
+  serving-fragment) serving_fragment;; health) health;;
+  list) ls registry/*.php 2>/dev/null | sed 's#.*/##; s#\.php$##';;
+  *) echo "usage: provision-tenant {provision|seed|deprovision|serving-fragment|health|list} <slug> [args]"; exit 1;;
+esac
