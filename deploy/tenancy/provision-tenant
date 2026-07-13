@@ -12,15 +12,31 @@ valid_slug(){ [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] && \
   ! grep -qxF "$1" <<<"www api mail admin dashboard app cdn static assets status docs deploy preview staging test dev internal cf pb pocketbase"; }
 
 cmd="${1:-}"; slug="${2:-}"
-# Optional flags after the slug (currently just --company "NAME").
-company=""
-_argv=("$@"); _i=2
+# Platform-scoped commands take no slug (`test-email --to x`), so a leading flag is not a slug.
+[[ "$slug" == --* ]] && slug=""
+
+# Optional flags. NOTE: a password is NEVER a flag — SMTP payloads arrive on stdin (argv is
+# world-readable through /proc/<pid>/cmdline).
+company=""; email=""; link=""; color=""; timezone=""; logo_file=""; logo_mime=""; to_addr=""
+_argv=("$@"); _i=1
 while [ "$_i" -lt "${#_argv[@]}" ]; do
   case "${_argv[$_i]}" in
-    --company) company="${_argv[$((_i+1))]:-}"; _i=$((_i+2));;
+    --company|--name) company="${_argv[$((_i+1))]:-}"; _i=$((_i+2));;
+    --email)      email="${_argv[$((_i+1))]:-}";      _i=$((_i+2));;
+    --link)       link="${_argv[$((_i+1))]:-}";       _i=$((_i+2));;
+    --color)      color="${_argv[$((_i+1))]:-}";      _i=$((_i+2));;
+    --timezone)   timezone="${_argv[$((_i+1))]:-}";   _i=$((_i+2));;
+    --logo-file)  logo_file="${_argv[$((_i+1))]:-}";  _i=$((_i+2));;
+    --logo-mime)  logo_mime="${_argv[$((_i+1))]:-}";  _i=$((_i+2));;
+    --to)         to_addr="${_argv[$((_i+1))]:-}";    _i=$((_i+2));;
     *) _i=$((_i+1));;
   esac
 done
+
+# Per-tenant + platform SMTP configs (JSON, 0640 root:33). A separate tree from the tenant registry, so
+# no glob (`list`, bootstrap's <slug>.php lookup) can ever confuse the two.
+EMAIL_DIR="$RUNTIME_DIR/email"
+WRITE_EMAIL="$(cd "$(dirname "$0")" && pwd)/write-email-config.py"
 
 provision(){
   valid_slug "$slug" || { echo "invalid slug"; exit 1; }
@@ -50,9 +66,20 @@ PHP
   # 3) per-tenant writable dirs, and (defensively) ensure the base storage tree is owned by the app
   #    user — EA verifies storage/ and its subdirs are writable by www-data at startup.
   dc exec -T app sh -lc "mkdir -p storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug} && chown www-data:www-data storage storage/sessions storage/cache storage/logs storage/uploads && chown -R www-data:www-data storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug}"
-  # 4) migrate + seed (idempotent: only install on an empty schema)
+  # 4) migrate + seed + clean-slate bootstrap (idempotent: only on an empty schema).
+  #    The `tenant initialize` MUST live inside this guard so it runs exactly once — a re-run would
+  #    clobber the live admin password the owner obtained via the on-demand Reset action.
   if ! mysql_root -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema='${db}' AND table_name='ea_users' LIMIT 1;" | grep -q 1; then
     dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php console install
+    # Resolve the admin/contact email (flag, else synthetic — never EA's john@example.org).
+    local admin_email="${email:-admin@${slug}.${BASE_DOMAIN}}"
+    # Kill the public default admin: rotate to a random, DISCARDED password + set email + clean demo.
+    # Pass the password by NAME (never -e KEY=VALUE, which would place it in the host `docker` argv).
+    local init_pw; init_pw="$(openssl rand -base64 24)"
+    EA_ADMIN_PASSWORD="$init_pw" EA_ADMIN_EMAIL="$admin_email" EA_TENANT_TIMEZONE="${timezone:-Asia/Nicosia}" \
+      dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" \
+      -e EA_ADMIN_PASSWORD -e EA_ADMIN_EMAIL -e EA_TENANT_TIMEZONE \
+      app php index.php tenant initialize
   fi
   # 5) apply the business display name (idempotent every run) so it isn't the default "Company Name".
   if [ -n "$company" ]; then
@@ -68,10 +95,22 @@ seed(){ # optional rich seed: provision-tenant seed <slug> <file.sql>
   echo "seeded ${slug} from ${file}"
 }
 
+reset_admin(){ # provision-tenant reset-admin <slug>  → prints ONLY the new password on stdout
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  local pw; pw="$(openssl rand -base64 24)"
+  # Route EA/docker chatter to stderr; the password is the ONLY thing on stdout. Pass by NAME (not argv).
+  EA_ADMIN_PASSWORD="$pw" \
+    dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" -e EA_ADMIN_PASSWORD \
+    app php index.php tenant reset_password >&2
+  printf '%s\n' "$pw"
+}
+
 deprovision(){
   local ident="ea_${slug//-/_}"
   mysql_root -e "DROP DATABASE IF EXISTS \`${ident}\`; DROP USER IF EXISTS '${ident}'@'%'; FLUSH PRIVILEGES;" || true
   rm -f "registry/${slug}.php"
+  # The business's own SMTP credentials must not outlive the business.
+  find "$EMAIL_DIR" -maxdepth 1 -name "${slug}.json" -delete 2>/dev/null || true
   dc exec -T app sh -lc "rm -rf storage/*/${slug}" || true
   echo "deprovisioned: ${slug}"
 }
@@ -91,9 +130,138 @@ NGINX
 
 health(){ curl -s -o /dev/null -w '%{http_code}\n' -H "Host: ${slug}.${BASE_DOMAIN}" -H 'X-Forwarded-Proto: https' "http://${UPSTREAM}/index.php/booking"; }
 
+suspend(){ # close the public booking site (EA-native disable_booking); keeps all data
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php tenant suspend >/dev/null
+  echo "suspended ${slug}"
+}
+resume(){ # reopen the public booking site
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php tenant resume >/dev/null
+  echo "resumed ${slug}"
+}
+stats(){ # provision-tenant stats <slug> -> ONE JSON line (non-secret counts + health)
+  valid_slug "$slug" || { echo '{"error":"invalid slug"}'; exit 1; }
+  local db="ea_${slug//-/_}" providers services linked appts customers tz disabled health bookable dis
+  providers=$(mysql_root "$db" -N -e "SELECT COUNT(*) FROM ea_users u JOIN ea_roles r ON u.id_roles=r.id WHERE r.slug='provider' AND u.is_private=0;" 2>/dev/null | tr -d '\r' || echo 0)
+  services=$(mysql_root "$db" -N -e "SELECT COUNT(*) FROM ea_services WHERE is_private=0;" 2>/dev/null | tr -d '\r' || echo 0)
+  linked=$(mysql_root "$db" -N -e "SELECT COUNT(*) FROM ea_services_providers;" 2>/dev/null | tr -d '\r' || echo 0)
+  appts=$(mysql_root "$db" -N -e "SELECT COUNT(*) FROM ea_appointments WHERE start_datetime>=NOW();" 2>/dev/null | tr -d '\r' || echo 0)
+  customers=$(mysql_root "$db" -N -e "SELECT COUNT(*) FROM ea_users u JOIN ea_roles r ON u.id_roles=r.id WHERE r.slug='customer';" 2>/dev/null | tr -d '\r' || echo 0)
+  tz=$(mysql_root "$db" -N -e "SELECT value FROM ea_settings WHERE name='default_timezone';" 2>/dev/null | tr -d '\r' || echo '')
+  disabled=$(mysql_root "$db" -N -e "SELECT value FROM ea_settings WHERE name='disable_booking';" 2>/dev/null | tr -d '\r' || echo 0)
+  health=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${slug}.${BASE_DOMAIN}" -H 'X-Forwarded-Proto: https' "http://${UPSTREAM}/index.php/booking" 2>/dev/null || echo 0)
+  bookable=false; { [ "${services:-0}" -gt 0 ] && [ "${providers:-0}" -gt 0 ] && [ "${linked:-0}" -gt 0 ]; } && bookable=true
+  dis=false; [ "${disabled:-0}" = "1" ] && dis=true
+  printf '{"bookable":%s,"services":%s,"providers":%s,"linked":%s,"appointments_upcoming":%s,"customers":%s,"timezone":"%s","disable_booking":%s,"health_http":%s}\n' \
+    "$bookable" "${services:-0}" "${providers:-0}" "${linked:-0}" "${appts:-0}" "${customers:-0}" "${tz:-}" "$dis" "${health:-0}"
+}
+
+apply_brand(){ # apply-brand <slug> --name N [--email E] [--link L] [--color C] [--logo-file F --logo-mime M]
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  # The logo is base64 on STDIN — never argv (a few hundred KB, and argv is world-readable).
+  if [ -n "$logo_file" ] && [ -s "$logo_file" ]; then
+    base64 -w0 "$logo_file" | \
+      EA_BRAND_NAME="$company" EA_BRAND_EMAIL="$email" EA_BRAND_LINK="$link" EA_BRAND_COLOR="$color" \
+      EA_BRAND_LOGO_MIME="$logo_mime" \
+      dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" \
+        -e EA_BRAND_NAME -e EA_BRAND_EMAIL -e EA_BRAND_LINK -e EA_BRAND_COLOR -e EA_BRAND_LOGO_MIME \
+        app php index.php tenant apply_brand >/dev/null
+  else
+    EA_BRAND_NAME="$company" EA_BRAND_EMAIL="$email" EA_BRAND_LINK="$link" EA_BRAND_COLOR="$color" \
+      dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" \
+        -e EA_BRAND_NAME -e EA_BRAND_EMAIL -e EA_BRAND_LINK -e EA_BRAND_COLOR \
+        app php index.php tenant apply_brand </dev/null >/dev/null
+  fi
+  echo "brand applied: ${slug}"
+}
+
+_install_email(){ # $1 = destination JSON; the payload (WITH the password) arrives on OUR stdin
+  mkdir -p "$EMAIL_DIR"; chmod 755 "$EMAIL_DIR"
+  python3 "$WRITE_EMAIL" "$1"   # writes 0640 root:33 atomically; prints nothing
+}
+
+set_platform_email(){  _install_email "$EMAIL_DIR/_platform.json"; echo "platform mailer updated"; }
+clear_platform_email(){
+  find "$EMAIL_DIR" -maxdepth 1 -name '_platform.json' -delete 2>/dev/null || true
+  echo "platform mailer cleared"
+}
+
+set_tenant_email(){
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  _install_email "$EMAIL_DIR/${slug}.json"; echo "mail settings updated: ${slug}"
+}
+clear_tenant_email(){
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  find "$EMAIL_DIR" -maxdepth 1 -name "${slug}.json" -delete 2>/dev/null || true
+  echo "mail settings cleared: ${slug}"
+}
+
+test_email(){ # test-email [<slug>] --to <addr>  → ONE JSON line on stdout
+  [ -n "$to_addr" ] || { echo '{"ok":false,"error":"recipient required"}'; exit 1; }
+  local out=""
+  if [ -n "$slug" ]; then
+    valid_slug "$slug" || { echo '{"ok":false,"error":"invalid slug"}'; exit 1; }
+    # Through EA itself, so the From/Reply-To this proves are the ones customers will see.
+    out="$(EA_TEST_EMAIL_TO="$to_addr" dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" \
+            -e EA_TEST_EMAIL_TO app php index.php tenant test_email 2>/dev/null || true)"
+  else
+    # Platform relay only — no tenant, no database.
+    out="$(EA_TEST_EMAIL_TO="$to_addr" dc exec -T -e EA_TEST_EMAIL_TO \
+            app php deploy/tenancy/smtp-test.php 2>/dev/null || true)"
+  fi
+  out="$(printf '%s' "$out" | tr -d '\r' | tail -n1)"
+  [ -n "$out" ] || out='{"ok":false,"error":"no response from the booking runtime"}'
+  printf '%s\n' "$out"
+}
+
+# --- the business owner, as an administrator of this tenant ----------------------------------------
+# The payload is JSON on STDIN and carries a password, so it goes to EA by ENVIRONMENT, never argv:
+# /proc/<pid>/cmdline is world-readable and /proc/<pid>/environ is not. Nothing here echoes it, and the
+# caller (booking-apply.sh) has already deleted the file it came from.
+#
+# Both of these DEMAND the word "ok" back from the runtime, and that is not belt-and-braces.
+# CodeIgniter's CLI router answers an unknown controller method with a 404 page and an exit code of
+# ZERO. So the first version of this — which threw EA's output away and trusted the exit code — ran
+# against an image that did not have `tenant set_owner` in it yet, reported success at every layer, and
+# created nothing. The lie travelled all the way to the dashboard, which said the owner could sign in.
+# An exit code from a web framework's CLI shim is not evidence. The word it prints is.
+ea_tenant_cmd(){ # ea_tenant_cmd <method>  — payload on stdin via EA_OWNER_JSON; prints EA's stdout
+  local method="$1" out
+  out="$(EA_OWNER_JSON="$payload" \
+    dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" -e EA_OWNER_JSON \
+    app php index.php tenant "$method" 2>/dev/null)" || return 1
+  case "$out" in
+    *ok*) return 0 ;;
+    *) echo "the booking runtime did not accept '$method'" >&2; return 1 ;;
+  esac
+}
+
+set_owner(){ # set-owner <slug>   <<< {"email":…,"name":…,"password":…}
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  local payload; payload="$(cat)"
+  [ -n "$payload" ] || { echo "empty owner payload" >&2; exit 1; }
+  ea_tenant_cmd set_owner || exit 1
+  echo "owner applied: ${slug}"
+}
+
+remove_owner(){ # remove-owner <slug>   <<< {"email":…}
+  valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
+  local payload; payload="$(cat)"
+  [ -n "$payload" ] || { echo "empty owner payload" >&2; exit 1; }
+  ea_tenant_cmd remove_owner || exit 1
+  echo "owner removed: ${slug}"
+}
+
 case "$cmd" in
   provision) provision;; seed) seed "$@";; deprovision) deprovision;;
+  reset-admin) reset_admin;; suspend) suspend;; resume) resume;; stats) stats;;
+  apply-brand) apply_brand;;
+  set-platform-email) set_platform_email;; clear-platform-email) clear_platform_email;;
+  set-tenant-email) set_tenant_email;;   clear-tenant-email) clear_tenant_email;;
+  test-email) test_email;;
+  set-owner) set_owner;; remove-owner) remove_owner;;
   serving-fragment) serving_fragment;; health) health;;
   list) ls registry/*.php 2>/dev/null | sed 's#.*/##; s#\.php$##';;
-  *) echo "usage: provision-tenant {provision|seed|deprovision|serving-fragment|health|list} <slug> [args]"; exit 1;;
+  *) echo "usage: provision-tenant {provision|seed|deprovision|reset-admin|suspend|resume|stats|apply-brand|set-platform-email|clear-platform-email|set-tenant-email|clear-tenant-email|test-email|set-owner|remove-owner|serving-fragment|health|list} [<slug>] [flags]"; exit 1;;
 esac

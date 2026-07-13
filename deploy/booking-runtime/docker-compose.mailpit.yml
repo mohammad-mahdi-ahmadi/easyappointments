@@ -1,0 +1,17 @@
+# TEST-ONLY mailbox. Never used in production — it exists so outbound email can be proven end to end
+# (EA → SMTP → an inbox we can read) with no external account and no secret.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mailpit.yml up -d
+#
+# Point the platform mailer at:  host=mailpit  port=1025  security=none  auth=off
+# Read what was delivered:       curl -s http://127.0.0.1:8025/api/v1/messages
+name: booking-runtime
+services:
+  mailpit:
+    # ghcr, not Docker Hub: no anonymous pull rate limit, and Hub's CDN has been unreliable for this repo.
+    image: ghcr.io/axllent/mailpit:v1.21
+    container_name: booking-mailpit
+    restart: unless-stopped
+    ports: ["127.0.0.1:8025:8025"] # web UI + API on the host loopback; SMTP stays inside eanet
+    networks: [eanet]
+    mem_limit: 96m

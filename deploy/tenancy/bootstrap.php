@@ -8,6 +8,10 @@
 
 $ea_registry_dir = getenv('EA_REGISTRY_DIR') ?: (__DIR__ . '/registry');
 
+// Where per-tenant + platform SMTP configs live (written on the host by provision-tenant, mounted
+// read-only into the container). Read by application/config/production/email.php.
+define('EA_EMAIL_DIR', getenv('EA_EMAIL_DIR') ?: (__DIR__ . '/email'));
+
 /** Extract the first DNS label (the business slug) from a host, or '' if none. */
 function ea_slug_from_host(string $host): string
 {
