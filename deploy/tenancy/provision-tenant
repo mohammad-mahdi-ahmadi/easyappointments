@@ -68,10 +68,11 @@ PHP
   dc exec -T app sh -lc "mkdir -p storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug} && chown www-data:www-data storage storage/sessions storage/cache storage/logs storage/uploads && chown -R www-data:www-data storage/sessions/${slug} storage/cache/${slug} storage/logs/${slug} storage/uploads/${slug}"
   # 4) migrate + seed + clean-slate bootstrap (idempotent: only on an empty schema).
   #    The `tenant initialize` MUST live inside this guard so it runs exactly once — a re-run would
-  #    clobber the live admin password the owner obtained via the on-demand Reset action.
+  #    clobber a live business user's password (after remove_default_admin, the "first admin" it rewrites
+  #    is whoever the platform put there).
   if ! mysql_root -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema='${db}' AND table_name='ea_users' LIMIT 1;" | grep -q 1; then
     dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" app php index.php console install
-    # Resolve the admin/contact email (flag, else synthetic — never EA's john@example.org).
+    # Resolve the contact email (flag, else synthetic — never EA's john@example.org).
     local admin_email="${email:-admin@${slug}.${BASE_DOMAIN}}"
     # Kill the public default admin: rotate to a random, DISCARDED password + set email + clean demo.
     # Pass the password by NAME (never -e KEY=VALUE, which would place it in the host `docker` argv).
@@ -81,6 +82,12 @@ PHP
       -e EA_ADMIN_PASSWORD -e EA_ADMIN_EMAIL -e EA_TENANT_TIMEZONE \
       app php index.php tenant initialize
   fi
+  # 4b) ...and then delete the seeded admin outright. A tenant has no administrator of its own: who may
+  # open its admin is decided on the platform and pushed here by set-owner. This sits OUTSIDE the
+  # install guard deliberately. It is idempotent, and if it ever fails, provision fails — so the retry
+  # has to be able to finish the job. Inside the guard it would be skipped on that retry (the schema now
+  # exists), and the tenant would keep its `administrator` for ever with nobody the wiser.
+  remove_default_admin
   # 5) apply the business display name (idempotent every run) so it isn't the default "Company Name".
   if [ -n "$company" ]; then
     local co; co="$(printf '%s' "$company" | tr -d '\r\n\\`' | cut -c1-190)"; co="${co//\'/\'\'}"
@@ -95,14 +102,22 @@ seed(){ # optional rich seed: provision-tenant seed <slug> <file.sql>
   echo "seeded ${slug} from ${file}"
 }
 
-reset_admin(){ # provision-tenant reset-admin <slug>  → prints ONLY the new password on stdout
+remove_default_admin(){ # provision-tenant remove-default-admin <slug>
+  # Delete the admin EA's installer seeds (`administrator`). Idempotent, so it is both the provision step
+  # and the repair for a tenant provisioned before this existed.
+  #
+  # It demands the word "ok" back for the same reason set-owner does: CodeIgniter's CLI router answers an
+  # unknown controller method with a 404 page and an exit code of ZERO, so a runtime image without this
+  # method would otherwise report success having deleted nothing.
   valid_slug "$slug" || { echo "invalid slug" >&2; exit 1; }
-  local pw; pw="$(openssl rand -base64 24)"
-  # Route EA/docker chatter to stderr; the password is the ONLY thing on stdout. Pass by NAME (not argv).
-  EA_ADMIN_PASSWORD="$pw" \
-    dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" -e EA_ADMIN_PASSWORD \
-    app php index.php tenant reset_password >&2
-  printf '%s\n' "$pw"
+  local out
+  out="$(dc exec -T -e APP_ENV=production -e EA_TENANT="${slug}" \
+    app php index.php tenant remove_default_admin 2>/dev/null)" || {
+      echo "the booking runtime could not remove the default admin" >&2; exit 1; }
+  case "$out" in
+    *ok*) echo "default admin removed: ${slug}" ;;
+    *) echo "the booking runtime did not accept 'remove_default_admin'" >&2; exit 1 ;;
+  esac
 }
 
 deprovision(){
@@ -255,7 +270,8 @@ remove_owner(){ # remove-owner <slug>   <<< {"email":…}
 
 case "$cmd" in
   provision) provision;; seed) seed "$@";; deprovision) deprovision;;
-  reset-admin) reset_admin;; suspend) suspend;; resume) resume;; stats) stats;;
+  remove-default-admin) remove_default_admin;;
+  suspend) suspend;; resume) resume;; stats) stats;;
   apply-brand) apply_brand;;
   set-platform-email) set_platform_email;; clear-platform-email) clear_platform_email;;
   set-tenant-email) set_tenant_email;;   clear-tenant-email) clear_tenant_email;;
@@ -263,5 +279,5 @@ case "$cmd" in
   set-owner) set_owner;; remove-owner) remove_owner;;
   serving-fragment) serving_fragment;; health) health;;
   list) ls registry/*.php 2>/dev/null | sed 's#.*/##; s#\.php$##';;
-  *) echo "usage: provision-tenant {provision|seed|deprovision|reset-admin|suspend|resume|stats|apply-brand|set-platform-email|clear-platform-email|set-tenant-email|clear-tenant-email|test-email|set-owner|remove-owner|serving-fragment|health|list} [<slug>] [flags]"; exit 1;;
+  *) echo "usage: provision-tenant {provision|seed|deprovision|remove-default-admin|suspend|resume|stats|apply-brand|set-platform-email|clear-platform-email|set-tenant-email|clear-tenant-email|test-email|set-owner|remove-owner|serving-fragment|health|list} [<slug>] [flags]"; exit 1;;
 esac

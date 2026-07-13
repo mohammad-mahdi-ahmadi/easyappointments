@@ -3,22 +3,34 @@
 /**
  * Tenant controller (ADDITIVE — multi-tenancy). CLI-only.
  *
- * Bootstraps/rotates a provisioned tenant's EA admin WITHOUT editing any upstream file. EA's installer
- * seeds a fixed public admin (administrator/administrator) plus demo records; these methods rotate the
- * password, set the real email, and delete the demo records — going through EA's own models so the
- * password is salted+hashed exactly as EA expects.
+ * Bootstraps a provisioned tenant WITHOUT editing any upstream file. EA's installer seeds a fixed public
+ * admin (administrator/administrator) plus demo records; these methods neutralise the seeded admin, set
+ * the business's real details, and replace the demo records — going through EA's own models wherever
+ * they will allow it, so passwords are salted+hashed exactly as EA expects.
  *
- * Secrets are read from the environment (never argv): EA_ADMIN_PASSWORD and EA_ADMIN_EMAIL.
+ * The tenant has no administrator of its own. Its people are decided on the platform and pushed here by
+ * set_owner / remove_owner; the seeded admin is deleted by remove_default_admin at provision time.
  *
- *   php index.php tenant initialize      # rotate admin + set tz + seed a functional neutral starter
- *   php index.php tenant reset_password  # rotate ONLY the admin password (on-demand reset)
- *   php index.php tenant suspend         # close the public booking site (EA-native disable_booking)
- *   php index.php tenant resume          # reopen the public booking site
- *   php index.php tenant apply_brand     # push the platform business brand into ea_settings
- *   php index.php tenant test_email      # send a test email with this tenant's real config
+ * Secrets are read from the environment (never argv): EA_ADMIN_PASSWORD, EA_ADMIN_EMAIL, EA_OWNER_JSON.
+ *
+ *   php index.php tenant initialize            # neutralise the seeded admin + tz + a functional starter
+ *   php index.php tenant remove_default_admin  # delete the seeded admin (idempotent)
+ *   php index.php tenant suspend               # close the public booking site (EA's disable_booking)
+ *   php index.php tenant resume                # reopen the public booking site
+ *   php index.php tenant apply_brand           # push the platform business brand into ea_settings
+ *   php index.php tenant test_email            # send a test email with this tenant's real config
+ *   php index.php tenant set_owner             # create/update a business user as an admin here
+ *   php index.php tenant remove_owner          # withdraw one
  */
 class Tenant extends EA_Controller
 {
+    /**
+     * The username of the admin EA's own installer seeds. It is the stable identifier: the account's
+     * name and email are rewritten by `initialize`, but its username never is — and an admin the
+     * platform creates carries their email as their username, so the two can never be confused.
+     */
+    private const DEFAULT_ADMIN_USERNAME = 'administrator';
+
     public function __construct()
     {
         if (!is_cli()) {
@@ -124,17 +136,27 @@ class Tenant extends EA_Controller
     }
 
     /**
-     * Rotate ONLY the admin password (used by the on-demand Reset action). No other change.
+     * Delete the admin EA's installer seeds (`administrator`), leaving the tenant with no administrator
+     * of its own. Idempotent, and safe to run on a tenant that already has business users.
+     *
+     * A tenant's people are decided on the platform, in one place, and pushed here by `set_owner`. The
+     * seeded account is the one login that was never decided there: nobody asked for it, nobody is told
+     * about it, and it exists in every tenant under the same name. Rotating its password to something we
+     * throw away (which is what `initialize` does) makes it unusable, but it is still an admin — it shows
+     * up in the business's own user list as "John Doe", and any admin can give it a password. So it goes.
+     *
+     * It deletes only ever the seeded account: one the platform created carries its email as its
+     * username, never `administrator`. See delete_admin() for why the model cannot do it.
      */
-    public function reset_password(): void
+    public function remove_default_admin(): void
     {
-        $password = (string) getenv('EA_ADMIN_PASSWORD');
+        foreach ($this->admins_model->get() as $admin) {
+            if (($admin['settings']['username'] ?? '') !== self::DEFAULT_ADMIN_USERNAME) {
+                continue;
+            }
 
-        if ($password === '') {
-            exit('EA_ADMIN_PASSWORD is required' . PHP_EOL);
+            $this->delete_admin((int) $admin['id']);
         }
-
-        $this->set_admin_password($password, null);
 
         response('ok' . PHP_EOL);
     }
@@ -277,15 +299,14 @@ class Tenant extends EA_Controller
     }
 
     /**
-     * A neutral host for the seeded placeholder provider email (never example.org). Uses the tenant slug.
-     */
-    /**
-     * Give the business's OWNER an administrator account here, with the same email and the same
-     * password as the login the platform issued them. One credential for the person, not one per tool.
+     * Give a business USER an administrator account here, with the same email and the same password as
+     * the login the platform issued them. One credential for the person, not one per tool.
      *
-     * A SECOND admin, alongside the platform's own `administrator`. Rewriting the existing admin's email
-     * instead — which set_admin_password() can do, and which reset_password() deliberately does not —
-     * would quietly lock the platform out of the tenant it provisioned.
+     * This is the ONLY way an admin account comes into existence in a tenant: the seeded `administrator`
+     * is deleted at provision time, so every admin in here is somebody the platform put there, and can
+     * be taken back out by remove_owner. A business may have several — each granted the booking
+     * capability in the platform's Access tab — and they are ordinary EA admins with no roles of ours
+     * layered on top: inside its own panel, the business manages its own people.
      *
      * The owner's email is also their USERNAME here: EA's login accepts `@` and `.` (Login.php), so
      * there is no second name to remember and no way for the two to drift apart.
@@ -385,14 +406,29 @@ class Tenant extends EA_Controller
             return;
         }
 
-        if (count($this->admins_model->get()) < 2) {
-            fwrite(STDERR, 'refusing to delete the only admin' . PHP_EOL);
-            exit(1);
-        }
-
-        $this->admins_model->delete((int) $matches[0]['id']);
+        // Note there is no "refusing to delete the only admin" guard, and there must not be. Withdrawing
+        // a business user is the platform saying that person may no longer open this panel, and it is not
+        // conditional on somebody else being left behind: a business whose last user is withdrawn is a
+        // business nobody may open the panel of, which is precisely what was asked for. That is also why
+        // this cannot go through Admins_model::delete() — see delete_admin().
+        $this->delete_admin((int) $matches[0]['id']);
 
         response('ok' . PHP_EOL);
+    }
+
+    /**
+     * Delete an admin, including the last one.
+     *
+     * Admins_model::delete() throws rather than leave the users table without an admin — EA's own rule,
+     * and the right one for a business that installed EA itself and must always be able to run it. A
+     * tenant here is not that: its administrators are granted by the platform and can all be taken away,
+     * and an empty admin list is the honest way to say "nobody may open this panel". Nothing else in EA
+     * depends on an admin existing — the public booking page reads settings, services and providers.
+     */
+    private function delete_admin(int $id): void
+    {
+        $this->db->delete('user_settings', ['id_users' => $id]);
+        $this->db->delete('users', ['id' => $id]);
     }
 
     private function tenant_host(): string
@@ -403,12 +439,16 @@ class Tenant extends EA_Controller
     }
 
     /**
-     * Load the (single) admin and save it back with a new password (and email when provided).
+     * Take the public default (administrator/administrator) off the seeded admin: a new password and the
+     * business's email. It is deleted moments later by remove_default_admin, and this still happens first
+     * on purpose — if that delete ever fails, the account left behind must be one nobody can sign in to,
+     * not the one whose password is printed in EA's install guide.
+     *
      * Admins_model::save() validates first_name/last_name/email even on update, so the whole record must
      * be passed; Admins_model::update() re-derives the salt from the DB, so only the plaintext password
      * is needed (never a pre-hashed value).
      */
-    private function set_admin_password(string $password, ?string $email): void
+    private function set_admin_password(string $password, string $email): void
     {
         $admins = $this->admins_model->get(null, 1);
 
@@ -418,10 +458,7 @@ class Tenant extends EA_Controller
 
         $admin = $admins[0];
         $admin['settings']['password'] = $password;
-
-        if ($email !== null) {
-            $admin['email'] = $email;
-        }
+        $admin['email'] = $email;
 
         $this->admins_model->save($admin);
     }
