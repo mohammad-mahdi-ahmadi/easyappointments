@@ -35,7 +35,9 @@ done
 
 # Per-tenant + platform SMTP configs (JSON, 0640 root:33). A separate tree from the tenant registry, so
 # no glob (`list`, bootstrap's <slug>.php lookup) can ever confuse the two.
-EMAIL_DIR="$RUNTIME_DIR/email"
+# The mail config is the PLATFORM's, and lives outside this runtime — the worker writes it, this runtime
+# and the invoicing runtime both read it. Overridable so a test can point it somewhere harmless.
+EMAIL_DIR="${BOOKING_EMAIL_DIR:-/srv/platform-mail}"
 WRITE_EMAIL="$(cd "$(dirname "$0")" && pwd)/write-email-config.py"
 
 provision(){
